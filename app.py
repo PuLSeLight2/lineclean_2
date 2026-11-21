@@ -3,6 +3,8 @@ import sqlite3, hashlib, secrets, json
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
+from io import BytesIO
+from artifact_tool import Workbook, SpreadsheetFile
 
 DB = Path(__file__).with_name("venue_wastage.db")
 DEFAULT_VENUES = ["Hotshots", "Rosso", "Centre", "Reds"]
@@ -131,6 +133,44 @@ def get_stock(venue, section, category=None):
     return [dict(r) for r in rows]
 
 
+def export_frame(frame):
+    out = frame.copy()
+    if "at" in out:
+        dt = pd.to_datetime(out.pop("at"), errors="coerce")
+        out.insert(0, "Date", dt.dt.strftime("%d/%m/%Y"))
+        out.insert(1, "Time", dt.dt.strftime("%H:%M:%S"))
+    if "qty" in out:
+        out.rename(columns={"qty": "Quantity (number of measures)", "unit": "Measure / unit", "unit_value": "Value per measure (£)", "total_value": "Total value (£)"}, inplace=True)
+        # Quantity is always the number of measures recorded, not a volume conversion.
+        # Volume is provided separately for products with a known ml measure.
+        import re
+        def ml_total(row):
+            unit = str(row.get("Measure / unit", ""))
+            match = re.search(r"(\d+(?:\.\d+)?)\s*ml\b", unit, re.I)
+            return round(float(row["Quantity (number of measures)"]) * float(match.group(1)), 2) if match else None
+        out.insert(out.columns.get_loc("Measure / unit") + 1, "Total volume (ml)", out.apply(ml_total, axis=1))
+    return out
+
+
+def excel_download(sheets):
+    wb = Workbook.create()
+    for title, data in sheets.items():
+        ws = wb.worksheets.add(title[:31])
+        clean = data.where(pd.notna(data), None)
+        headers = list(clean.columns)
+        rows = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in clean.itertuples(index=False, name=None)]
+        ws.get_range_by_indexes(0, 0, 1 + len(rows), len(headers)).values = [headers] + rows
+        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.fill = "#17365D"
+        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.font.color = "#FFFFFF"
+        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.font.bold = True
+        ws.freeze_panes.freeze_rows(1)
+        ws.get_range_by_indexes(0, 0, 1 + len(rows), len(headers)).format.autofit_columns()
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".xlsx") as f:
+        SpreadsheetFile.export_xlsx(wb).save(f.name)
+        return Path(f.name).read_bytes()
+
+
 def money(value):
     return f"£{float(value):,.2f}"
 
@@ -236,7 +276,8 @@ with st.sidebar:
     pages = []
     if has("line_clean"): pages.append("Line clean wastage")
     if has("general_waste"): pages.append("General wastage")
-    if has("history"): pages.append("History")
+    if has("history"):
+        pages.extend(["Dashboard", "History"])
     if has("stock"): pages.append("Stock settings")
     if is_admin: pages.append("Admin control")
     if not pages:
@@ -310,6 +351,81 @@ elif page == "General wastage":
             st.success("General wastage saved.")
             st.rerun()
 
+elif page == "Dashboard":
+    st.subheader(f"{venue} — Wastage dashboard")
+    period = st.selectbox("Reporting period", ["Last 7 days", "Last 30 days", "This month", "All time"])
+    now = pd.Timestamp.now()
+    since = (now - pd.Timedelta(days=7) if period == "Last 7 days" else
+             now - pd.Timedelta(days=30) if period == "Last 30 days" else
+             now.normalize().replace(day=1) if period == "This month" else None)
+    c = db()
+    lines = pd.read_sql_query("SELECT * FROM line_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
+    general = pd.read_sql_query("SELECT * FROM general_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
+    c.close()
+    for frame in (lines, general):
+        if not frame.empty:
+            frame["at"] = pd.to_datetime(frame["at"], errors="coerce")
+            frame.dropna(subset=["at"], inplace=True)
+            if since is not None:
+                frame.drop(frame.index[frame["at"] < since], inplace=True)
+    a,b,c,d = st.columns(4)
+    a.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.0f} pints")
+    b.metric("General waste value", money(general['total_value'].sum() if not general.empty else 0))
+    c.metric("Line-clean entries", len(lines))
+    d.metric("General waste entries", len(general))
+    st.markdown("### Daily trends")
+    if not lines.empty:
+        day_line = lines.assign(Day=lines["at"].dt.strftime("%Y-%m-%d")).groupby("Day")["total_pints"].sum()
+        st.caption("Line-clean pints by day")
+        st.bar_chart(day_line)
+    if not general.empty:
+        day_general = general.assign(Day=general["at"].dt.strftime("%Y-%m-%d")).groupby("Day")["total_value"].sum()
+        st.caption("General wastage value (£) by day")
+        st.bar_chart(day_general)
+    if lines.empty and general.empty:
+        st.info("No wastage recorded for this reporting period.")
+    left,right = st.columns(2)
+    with left:
+        st.markdown("### General waste by category")
+        if not general.empty:
+            totals = general.groupby("category")["total_value"].sum().sort_values(ascending=False)
+            st.bar_chart(totals)
+            st.dataframe(totals.rename("Value (£)"), use_container_width=True)
+        else:
+            st.caption("No general wastage entries")
+    with right:
+        st.markdown("### Line-clean pints by product")
+        totals = {}
+        for detail in lines["detail"] if not lines.empty else []:
+            try:
+                for item in json.loads(detail):
+                    product = item["Product"]
+                    totals[product] = totals.get(product, 0) + float(item["Total wasted (pints)"])
+            except (KeyError, ValueError, TypeError):
+                continue
+        if totals:
+            product_totals = pd.Series(totals, name="Pints wasted").sort_values(ascending=False)
+            st.bar_chart(product_totals)
+            st.dataframe(product_totals, use_container_width=True)
+        else:
+            st.caption("No line-clean wastage entries")
+    st.markdown("### Team activity")
+    staff = pd.concat([lines[["username"]], general[["username"]]], ignore_index=True)
+    if not staff.empty:
+        st.dataframe(staff.groupby("username").size().rename("Records").sort_values(ascending=False), use_container_width=True)
+    else:
+        st.caption("No activity for this period")
+    st.markdown("### Latest entries")
+    recent = []
+    for _, row in lines.head(10).iterrows():
+        recent.append({"at": row["at"], "Type": "Line clean", "Team member": row["username"], "Detail": f"{row['total_pints']} pints"})
+    for _, row in general.head(10).iterrows():
+        recent.append({"at": row["at"], "Type": "General", "Team member": row["username"], "Detail": f"{row['qty']:g} × {row['unit']} {row['item']} — {money(row['total_value'])}"})
+    if recent:
+        st.dataframe(export_frame(pd.DataFrame(recent).sort_values("at", ascending=False).head(10)), hide_index=True, use_container_width=True)
+    if not lines.empty or not general.empty:
+        st.download_button("Download dashboard data (Excel)", excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}), file_name=f"{venue}_dashboard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 elif page == "History":
     st.subheader(f"{venue} wastage history")
     c = db()
@@ -331,14 +447,9 @@ elif page == "History":
             st.info("No general wastage saved yet.")
         else:
             st.metric("Total general wastage value", money(general.total_value.sum()))
-            st.dataframe(general[["at","username","category","item","qty","unit","unit_value","total_value","notes"]],
-                         hide_index=True, use_container_width=True)
-    if not lines.empty:
-        st.download_button("Export line-clean history", lines.to_csv(index=False).encode(),
-                           file_name=f"{venue.lower()}_lineclean.csv")
-    if not general.empty:
-        st.download_button("Export general wastage history", general.to_csv(index=False).encode(),
-                           file_name=f"{venue.lower()}_general_wastage.csv")
+            st.dataframe(export_frame(general[["at","username","category","item","qty","unit","unit_value","total_value","notes"]]), hide_index=True, use_container_width=True)
+    if not lines.empty or not general.empty:
+        st.download_button("Download wastage history (Excel)", excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}), file_name=f"{venue}_wastage_history.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif page == "Stock settings":
     st.subheader("Stock settings")

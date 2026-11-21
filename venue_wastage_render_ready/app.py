@@ -1,7 +1,8 @@
 import streamlit as st
 import sqlite3, hashlib, secrets, json, os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import pandas as pd
 from io import BytesIO
 from openpyxl import Workbook
@@ -13,6 +14,42 @@ from openpyxl.utils import get_column_letter
 DATA_DIR = Path(os.environ.get("WASTAGE_DATA_DIR", str(Path(__file__).resolve().parent)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "venue_wastage.db"
+UK_TZ = ZoneInfo("Europe/London")
+
+
+def current_work_week():
+    """Current UK Friday 00:00 to next Friday 00:00 (exclusive)."""
+    today = datetime.now(UK_TZ).date()
+    return today - timedelta(days=(today.weekday() - 4) % 7)
+
+
+def work_week_start(value):
+    """Friday associated with a stored local timestamp."""
+    date_value = pd.Timestamp(value).date()
+    return date_value - timedelta(days=(date_value.weekday() - 4) % 7)
+
+
+def week_label(start):
+    return f"Fri {start:%d %b %Y} – Thu {(start + timedelta(days=6)):%d %b %Y}"
+
+
+def filter_work_week(frame, start):
+    if frame.empty:
+        return frame
+    timestamps = pd.to_datetime(frame["at"], errors="coerce")
+    end = start + timedelta(days=7)
+    return frame.loc[(timestamps.dt.date >= start) & (timestamps.dt.date < end)].copy()
+
+
+def available_work_weeks(*frames):
+    weeks = {current_work_week()}
+    for frame in frames:
+        if not frame.empty:
+            for timestamp in pd.to_datetime(frame["at"], errors="coerce").dropna():
+                weeks.add(work_week_start(timestamp))
+    return sorted(weeks, reverse=True)
+
+
 DEFAULT_VENUES = ["Hotshots", "Rosso", "Centre", "Reds"]
 LINE_DEFAULTS = ["Coors", "Madri", "Stowford", "Carling", "Carling Darkfruits", "Guinness", "Alpaca"]
 GENERAL_CATEGORIES = ["Draught", "Bottle beers", "Soft bottle", "Postmix", "Spirits", "Wine"]
@@ -362,8 +399,8 @@ elif page == "General wastage":
 
 elif page == "Dashboard":
     st.subheader(f"{venue} — Wastage dashboard")
-    period = st.selectbox("Reporting period", ["Last 7 days", "Last 30 days", "This month", "All time"])
-    now = pd.Timestamp.now()
+    period = st.selectbox("Reporting period", ["Current working week (Fri–Thu)", "Previous working week (Fri–Thu)", "Last 7 days", "Last 30 days", "This month", "All time"])
+    now = pd.Timestamp(datetime.now(UK_TZ).replace(tzinfo=None))
     since = (now - pd.Timedelta(days=7) if period == "Last 7 days" else
              now - pd.Timedelta(days=30) if period == "Last 30 days" else
              now.normalize().replace(day=1) if period == "This month" else None)
@@ -371,6 +408,13 @@ elif page == "Dashboard":
     lines = pd.read_sql_query("SELECT * FROM line_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
     general = pd.read_sql_query("SELECT * FROM general_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
     c.close()
+    if period in ("Current working week (Fri–Thu)", "Previous working week (Fri–Thu)"):
+        week_start = current_work_week()
+        if period.startswith("Previous"):
+            week_start -= timedelta(days=7)
+        st.caption(f"Reporting week: {week_label(week_start)} (UK time)")
+        lines = filter_work_week(lines, week_start)
+        general = filter_work_week(general, week_start)
     for frame in (lines, general):
         if not frame.empty:
             frame["at"] = pd.to_datetime(frame["at"], errors="coerce")
@@ -436,29 +480,42 @@ elif page == "Dashboard":
         st.download_button("Download dashboard data (Excel)", excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}), file_name=f"{venue}_dashboard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif page == "History":
-    st.subheader(f"{venue} wastage history")
+    st.subheader(f"{venue} — Weekly wastage history")
+    st.caption("Working weeks run Friday 00:00 through Thursday 23:59:59, UK time. Older records are retained.")
     c = db()
-    lines = pd.read_sql_query("SELECT * FROM line_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
-    general = pd.read_sql_query("SELECT * FROM general_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
+    all_lines = pd.read_sql_query("SELECT * FROM line_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
+    all_general = pd.read_sql_query("SELECT * FROM general_logs WHERE venue=? ORDER BY at DESC", c, params=(venue,))
     c.close()
+    weeks = available_work_weeks(all_lines, all_general)
+    selected_week = st.selectbox("Select working week", weeks, format_func=week_label)
+    lines = filter_work_week(all_lines, selected_week)
+    general = filter_work_week(all_general, selected_week)
+    st.caption(f"Selected: {week_label(selected_week)}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.0f} pints")
+    col2.metric("General wastage value", money(general['total_value'].sum() if not general.empty else 0))
+    col3.metric("Records", len(lines) + len(general))
     t1, t2 = st.tabs(["Line cleans", "General wastage"])
     with t1:
         if lines.empty:
-            st.info("No line cleans saved yet.")
+            st.info("No line cleans saved for this week.")
         else:
-            st.metric("Total line-clean waste", f"{lines.total_pints.sum():,.0f} pints")
             for _, row in lines.iterrows():
                 with st.expander(f"{row['at'][:16].replace('T',' ')} — {row['total_pints']} pints — {row['username']}"):
                     st.dataframe(pd.DataFrame(json.loads(row["detail"])), hide_index=True, use_container_width=True)
                     if row["notes"]: st.caption(row["notes"])
     with t2:
         if general.empty:
-            st.info("No general wastage saved yet.")
+            st.info("No general wastage saved for this week.")
         else:
-            st.metric("Total general wastage value", money(general.total_value.sum()))
             st.dataframe(export_frame(general[["at","username","category","item","qty","unit","unit_value","total_value","notes"]]), hide_index=True, use_container_width=True)
     if not lines.empty or not general.empty:
-        st.download_button("Download wastage history (Excel)", excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}), file_name=f"{venue}_wastage_history.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Download selected week (Excel)",
+            excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}),
+            file_name=f"{venue}_wastage_{selected_week.isoformat()}_to_{(selected_week + timedelta(days=6)).isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("No entries for this week yet. Select an older week to review its history.")
 
 elif page == "Stock settings":
     st.subheader("Stock settings")

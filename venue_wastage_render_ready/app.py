@@ -4,7 +4,9 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from io import BytesIO
-from artifact_tool import Workbook, SpreadsheetFile
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # Use Render's persistent disk when WASTAGE_DATA_DIR=/var/data is configured.
 # On your computer, the database remains beside app.py by default.
@@ -157,22 +159,25 @@ def export_frame(frame):
 
 
 def excel_download(sheets):
-    wb = Workbook.create()
+    wb = Workbook()
+    wb.remove(wb.active)
     for title, data in sheets.items():
-        ws = wb.worksheets.add(title[:31])
-        clean = data.where(pd.notna(data), None)
-        headers = list(clean.columns)
-        rows = [[(v.item() if hasattr(v, "item") else v) for v in row] for row in clean.itertuples(index=False, name=None)]
-        ws.get_range_by_indexes(0, 0, 1 + len(rows), len(headers)).values = [headers] + rows
-        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.fill = "#17365D"
-        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.font.color = "#FFFFFF"
-        ws.get_range_by_indexes(0, 0, 1, len(headers)).format.font.bold = True
-        ws.freeze_panes.freeze_rows(1)
-        ws.get_range_by_indexes(0, 0, 1 + len(rows), len(headers)).format.autofit_columns()
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".xlsx") as f:
-        SpreadsheetFile.export_xlsx(wb).save(f.name)
-        return Path(f.name).read_bytes()
+        ws = wb.create_sheet(title[:31])
+        clean = data.astype(object).where(pd.notna(data), None)
+        ws.append(list(clean.columns))
+        for row in clean.itertuples(index=False, name=None):
+            ws.append([v.item() if hasattr(v, "item") else v for v in row])
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor="17365D")
+            cell.font = Font(bold=True, color="FFFFFF")
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col in ws.columns:
+            width = max((len(str(cell.value)) if cell.value is not None else 0) for cell in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(40, max(12, width + 2))
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
 
 
 def money(value):

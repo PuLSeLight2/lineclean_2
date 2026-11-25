@@ -108,11 +108,16 @@ def db():
       unit_value REAL NOT NULL, total_value REAL NOT NULL, notes TEXT
     );
     """)
+    c.execute("CREATE TABLE IF NOT EXISTS categories(venue TEXT, name TEXT, active INTEGER DEFAULT 1, PRIMARY KEY(venue,name))")
     # Upgrade older versions of the app in place.
     existing = {r["name"] for r in c.execute("SELECT name FROM venues").fetchall()}
     for name in DEFAULT_VENUES:
         if name not in existing:
             c.execute("INSERT OR IGNORE INTO venues(name) VALUES(?)", (name,))
+    for v in c.execute("SELECT name FROM venues").fetchall():
+        for cat in GENERAL_CATEGORIES:
+            c.execute("INSERT OR IGNORE INTO categories VALUES(?,?,1)", (v[0],cat))
+    c.execute("INSERT OR IGNORE INTO categories(venue,name) SELECT DISTINCT venue,category FROM stock WHERE section='General'")
     c.commit()
     return c
 
@@ -164,6 +169,11 @@ def has(permission):
     return get_permissions(u["id"], u["role"]).get(permission, False)
 
 
+def categories(venue):
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT name FROM categories WHERE venue=? AND active=1 ORDER BY name", (venue,))]
+
+
 def get_stock(venue, section, category=None):
     c = db()
     if category is None:
@@ -191,7 +201,7 @@ def export_frame(frame):
             unit = str(row.get("Measure / unit", ""))
             match = re.search(r"(\d+(?:\.\d+)?)\s*ml\b", unit, re.I)
             return round(float(row["Quantity (number of measures)"]) * float(match.group(1)), 2) if match else None
-        out.insert(out.columns.get_loc("Measure / unit") + 1, "Total volume (ml)", out.apply(ml_total, axis=1))
+        out.insert(out.columns.get_loc("Measure / unit") + 1, "Total volume (ml)", [ml_total(row) for _, row in out.iterrows()])
     return out
 
 
@@ -204,6 +214,11 @@ def excel_download(sheets):
         ws.append(list(clean.columns))
         for row in clean.itertuples(index=False, name=None):
             ws.append([v.item() if hasattr(v, "item") else v for v in row])
+            for cell in ws[ws.max_row]:
+                if isinstance(cell.value, str):
+                    cell.data_type = 's'
+                cell.font = Font(color='000000')
+                cell.fill = PatternFill('solid', fgColor='FFFFFF')
         for cell in ws[1]:
             cell.fill = PatternFill("solid", fgColor="17365D")
             cell.font = Font(bold=True, color="FFFFFF")
@@ -222,7 +237,7 @@ def money(value):
 
 
 def logout():
-    st.session_state.pop("user", None)
+    st.session_state.clear()
     st.rerun()
 
 
@@ -238,7 +253,7 @@ def save_line_clean(venue, username, first, second, notes):
     c = db()
     c.execute("""INSERT INTO line_logs(venue,at,username,notes,first_taps,second_taps,total_pints,detail)
                  VALUES(?,?,?,?,?,?,?,?)""",
-              (venue, datetime.now().isoformat(timespec="seconds"), username, notes,
+              (venue, datetime.now(UK_TZ).replace(tzinfo=None).isoformat(timespec="seconds"), username, notes,
                ft, staps, (ft+staps)*5, json.dumps(detail)))
     c.commit()
     c.close()
@@ -315,22 +330,51 @@ if not assigned:
         logout()
     st.stop()
 
+# Refresh permissions and account status on every rerun.
+with db() as c:
+    fresh = c.execute("SELECT * FROM users WHERE id=? AND active=1", (user['id'],)).fetchone()
+if not fresh:
+    logout()
+st.session_state.user = user = dict(fresh)
+is_admin = user['role'] == 'admin'
+is_manager = user['role'] == 'manager'
+assigned = all_venues() if is_admin else get_access(user['id'])
+if st.session_state.get('chosen_venue') not in assigned:
+    st.session_state.pop('chosen_venue', None)
+    st.session_state.pop('chosen_page', None)
+    st.title('Select your venue')
+    for v in assigned:
+        if st.button(v, key='choose_'+v, use_container_width=True):
+            st.session_state.chosen_venue = v
+            st.rerun()
+    if st.button('Log out'): logout()
+    st.stop()
+venue = st.session_state.chosen_venue
+pages = []
+if has('general_waste'): pages.append('General wastage')
+if has('line_clean'): pages.append('Line clean wastage')
+if has('history'): pages.extend(['Dashboard','History'])
+if has('stock'): pages.append('Stock settings')
+if is_admin: pages.append('Admin control')
 with st.sidebar:
-    st.write(f"**{user['username']}**")
-    st.caption(user["role"].replace("_", " ").title())
-    venue = st.selectbox("Venue", assigned)
-    pages = []
-    if has("line_clean"): pages.append("Line clean wastage")
-    if has("general_waste"): pages.append("General wastage")
-    if has("history"):
-        pages.extend(["Dashboard", "History"])
-    if has("stock"): pages.append("Stock settings")
-    if is_admin: pages.append("Admin control")
-    if not pages:
-        st.warning("No permissions have been assigned to this account.")
-    page = st.radio("Section", pages) if pages else None
-    if st.button("Log out"):
-        logout()
+    st.write(user['username'])
+    st.write(venue)
+    if st.button('Change venue'):
+        st.session_state.pop('chosen_venue',None)
+        st.session_state.pop('chosen_page',None)
+        st.rerun()
+    if st.button('Main menu'):
+        st.session_state.pop('chosen_page',None)
+        st.rerun()
+    if st.button('Log out'): logout()
+if st.session_state.get('chosen_page') not in pages:
+    st.title(f'{venue} — Select a section')
+    for option in pages:
+        if st.button(option, key='page_'+option, use_container_width=True):
+            st.session_state.chosen_page = option
+            st.rerun()
+    st.stop()
+page = st.session_state.chosen_page
 
 st.title(f"{venue} — Venue Wastage")
 
@@ -343,6 +387,10 @@ if page == "Line clean wastage":
     else:
         left, right = st.columns(2)
         first, second = {}, {}
+        if st.session_state.pop("reset_line", False):
+            for item in products:
+                st.session_state.pop(f"f_{venue}_{item['id']}", None)
+                st.session_state.pop(f"s_{venue}_{item['id']}", None)
         with left:
             st.markdown("#### First pull-through")
             for item in products:
@@ -367,15 +415,14 @@ if page == "Line clean wastage":
         notes = st.text_input("Notes (optional)", key="line_notes")
         if st.button("Save line clean", type="primary", disabled=(ft+staps == 0)):
             save_line_clean(venue, user["username"], first, second, notes)
-            for item in products:
-                st.session_state[f"f_{venue}_{item['id']}"] = 0
-                st.session_state[f"s_{venue}_{item['id']}"] = 0
+            st.session_state.reset_line = True
             st.success("Line clean saved.")
             st.rerun()
 
 elif page == "General wastage":
     st.subheader("General wastage")
-    category = st.selectbox("Category", GENERAL_CATEGORIES)
+    category = st.selectbox("Category", categories(venue))
+    if category is None: st.stop()
     items = get_stock(venue, "General", category)
     if not items:
         st.info("No active stock in this category. Add items in Stock settings.")
@@ -389,7 +436,7 @@ elif page == "General wastage":
             c = db()
             c.execute("""INSERT INTO general_logs(venue,at,username,category,item,qty,unit,unit_value,total_value,notes)
                          VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                      (venue, datetime.now().isoformat(timespec="seconds"), user["username"], category,
+                      (venue, datetime.now(UK_TZ).replace(tzinfo=None).isoformat(timespec="seconds"), user["username"], category,
                        chosen["name"], qty, chosen["unit"], chosen["unit_value"],
                        qty*chosen["unit_value"], notes))
             c.commit()
@@ -509,6 +556,20 @@ elif page == "History":
             st.info("No general wastage saved for this week.")
         else:
             st.dataframe(export_frame(general[["at","username","category","item","qty","unit","unit_value","total_value","notes"]]), hide_index=True, use_container_width=True)
+    if is_admin or is_manager:
+        st.markdown('### Delete incorrect wastage records')
+        records = {}
+        for table, frame in [('line_logs',lines),('general_logs',general)]:
+            for _, r in frame.iterrows():
+                description = f"{r['total_pints']} pints" if table == 'line_logs' else f"{r['item']} × {r['qty']}"
+                records[f"{table} #{r['id']} — {r['at']} — {description}"] = (table,int(r['id']))
+        if records:
+            selected = st.selectbox('Record to delete', list(records))
+            if st.checkbox('Confirm permanent deletion of this record') and st.button('Delete wastage record'):
+                table, rid = records[selected]
+                with db() as c:
+                    c.execute(f"DELETE FROM {table} WHERE id=? AND venue=?", (rid,venue))
+                st.rerun()
     if not lines.empty or not general.empty:
         st.download_button("Download selected week (Excel)",
             excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}),
@@ -522,7 +583,29 @@ elif page == "Stock settings":
     st.caption("These changes apply only to the currently selected venue.")
     kind = st.radio("Stock list", ["Line-clean products", "General wastage products"], horizontal=True)
     if kind == "General wastage products":
-        category = st.selectbox("Category", GENERAL_CATEGORIES)
+        with st.form('category_add'):
+            new_cat = st.text_input('New category')
+            if st.form_submit_button('Add category') and new_cat.strip():
+                with db() as c:
+                    c.execute("INSERT INTO categories VALUES(?,?,1) ON CONFLICT(venue,name) DO UPDATE SET active=1", (venue,new_cat.strip()))
+                st.rerun()
+        category = st.selectbox("Category", categories(venue))
+        if category is not None:
+            if st.checkbox('Confirm removal of this category and its active stock') and st.button('Delete category'):
+                with db() as c:
+                    c.execute("UPDATE categories SET active=0 WHERE venue=? AND name=?", (venue,category))
+                    c.execute("UPDATE stock SET active=0 WHERE venue=? AND section='General' AND category=?", (venue,category))
+                st.rerun()
+        st.markdown('### Sync general stock to other venues')
+        targets = st.multiselect('Destination venues', [v for v in assigned if v != venue])
+        st.caption('Copies active categories and products, including units and values. Matching products are updated; destination-only products are kept.')
+        if st.checkbox('Confirm stock sync') and st.button('Sync stock lists', disabled=not targets):
+            with db() as c:
+                for target in targets:
+                    c.execute("INSERT INTO categories(venue,name,active) SELECT ?,name,1 FROM categories WHERE venue=? AND active=1 ON CONFLICT(venue,name) DO UPDATE SET active=1", (target,venue))
+                    c.execute("INSERT INTO stock(venue,section,category,name,unit,unit_value,active) SELECT ?,section,category,name,unit,unit_value,1 FROM stock WHERE venue=? AND section='General' AND active=1 ON CONFLICT(venue,section,category,name) DO UPDATE SET unit=excluded.unit,unit_value=excluded.unit_value,active=1", (target,venue))
+            st.success('Stock lists synced.')
+        if category is None: st.stop()
         section, cat = "General", category
     else:
         section, cat = "Line clean", "Line clean"
@@ -543,6 +626,10 @@ elif page == "Stock settings":
                 c.close()
                 st.success("Stock item updated.")
                 st.rerun()
+            if st.checkbox('Confirm stock removal', key=f'remove_confirm_{item["id"]}') and st.button('Delete stock item', key=f'remove_{item["id"]}'):
+                with db() as c:
+                    c.execute("UPDATE stock SET active=0 WHERE id=? AND venue=?", (item['id'],venue))
+                st.rerun()
     st.markdown("#### Add a stock item")
     with st.form("add_stock"):
         new_name = st.text_input("New stock name")
@@ -555,7 +642,7 @@ elif page == "Stock settings":
         else:
             c = db()
             try:
-                c.execute("INSERT INTO stock(venue,section,category,name,unit,unit_value) VALUES(?,?,?,?,?,?)",
+                c.execute("INSERT INTO stock(venue,section,category,name,unit,unit_value) VALUES(?,?,?,?,?,?) ON CONFLICT(venue,section,category,name) DO UPDATE SET unit=excluded.unit,unit_value=excluded.unit_value,active=1",
                           (venue, section, cat, new_name.strip(), new_unit.strip(), new_value))
                 c.commit()
                 st.success("Stock item added.")
@@ -607,6 +694,7 @@ elif page == "Admin control" and is_admin:
                                       (venue_name.strip(), int(venue_active), vr["id"]))
                             if venue_name.strip() != vr["name"]:
                                 c.execute("UPDATE access SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
+                                c.execute("UPDATE categories SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE stock SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE line_logs SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE general_logs SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))

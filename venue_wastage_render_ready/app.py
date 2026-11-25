@@ -174,6 +174,23 @@ def categories(venue):
         return [r[0] for r in c.execute("SELECT name FROM categories WHERE venue=? AND active=1 ORDER BY name", (venue,))]
 
 
+def sync_general_prices(c, source, targets):
+    counts = {}
+    for target in targets:
+        if target == source:
+            continue
+        result = c.execute("""UPDATE stock AS dest SET unit_value = (
+            SELECT orig.unit_value FROM stock AS orig
+            WHERE orig.venue=? AND orig.section='General' AND orig.active=1
+            AND orig.category=dest.category AND orig.name=dest.name AND orig.unit=dest.unit
+        ) WHERE dest.venue=? AND dest.section='General' AND dest.active=1
+        AND EXISTS (SELECT 1 FROM stock AS orig WHERE orig.venue=?
+            AND orig.section='General' AND orig.active=1 AND orig.category=dest.category
+            AND orig.name=dest.name AND orig.unit=dest.unit)""", (source,target,source))
+        counts[target] = result.rowcount
+    return counts
+
+
 def get_stock(venue, section, category=None):
     c = db()
     if category is None:
@@ -429,7 +446,7 @@ elif page == "General wastage":
     else:
         options = {f"{x['name']} — {money(x['unit_value'])} per {x['unit']}": x for x in items}
         chosen = options[st.selectbox("Stock item", list(options))]
-        qty = st.number_input(f"Quantity wasted ({chosen['unit']})", min_value=0.0, step=0.25)
+        qty = st.number_input(f"Quantity wasted ({chosen['unit']})", min_value=0.0, value=0.0, step=1.0, format="%.2f")
         st.metric("Calculated wastage value", money(qty * chosen["unit_value"]))
         notes = st.text_input("Notes (optional)", key="general_notes")
         if st.button("Save general wastage", type="primary", disabled=qty <= 0):
@@ -605,6 +622,14 @@ elif page == "Stock settings":
                     c.execute("INSERT INTO categories(venue,name,active) SELECT ?,name,1 FROM categories WHERE venue=? AND active=1 ON CONFLICT(venue,name) DO UPDATE SET active=1", (target,venue))
                     c.execute("INSERT INTO stock(venue,section,category,name,unit,unit_value,active) SELECT ?,section,category,name,unit,unit_value,1 FROM stock WHERE venue=? AND section='General' AND active=1 ON CONFLICT(venue,section,category,name) DO UPDATE SET unit=excluded.unit,unit_value=excluded.unit_value,active=1", (target,venue))
             st.success('Stock lists synced.')
+        st.markdown('### Sync pricing only')
+        price_targets = st.multiselect('Venues to update prices', [v for v in assigned if v != venue], key='price_targets')
+        st.caption('Copies saved values per unit from this venue to active matching general stock (same category, name and unit). No products are added or removed. Past wastage is unchanged.')
+        if st.checkbox('Confirm overwriting matching prices', key='price_confirm') and st.button('Sync pricing', disabled=not price_targets):
+            with db() as c:
+                counts = sync_general_prices(c, venue, price_targets)
+            for target, count in counts.items():
+                st.success(f'{target}: {count} matching product prices updated.')
         if category is None: st.stop()
         section, cat = "General", category
     else:

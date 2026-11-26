@@ -122,6 +122,31 @@ def db():
     return c
 
 
+def delete_user(actor, target_id, target_username, target_salt):
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        admin = c.execute("SELECT * FROM users WHERE id=? AND username=? AND salt=? AND active=1 AND role='admin'", (actor['id'], actor['username'], actor['salt'])).fetchone()
+        if not admin:
+            raise ValueError("Only an active Admin can delete accounts.")
+        target = c.execute("SELECT * FROM users WHERE id=? AND username=? AND salt=?", (target_id, target_username, target_salt)).fetchone()
+        if not target:
+            raise ValueError("Account changed or no longer exists. Refresh and try again.")
+        if target_id == admin['id']:
+            raise ValueError("You cannot delete your own account.")
+        if target['role'] == 'admin' and target['active'] and c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0] <= 1:
+            raise ValueError("The last active Admin cannot be deleted.")
+        c.execute("DELETE FROM access WHERE user_id=?", (target_id,))
+        c.execute("DELETE FROM user_permissions WHERE user_id=?", (target_id,))
+        c.execute("DELETE FROM users WHERE id=?", (target_id,))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
 def hash_password(password, salt):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
 
@@ -349,7 +374,7 @@ if not assigned:
 
 # Refresh permissions and account status on every rerun.
 with db() as c:
-    fresh = c.execute("SELECT * FROM users WHERE id=? AND active=1", (user['id'],)).fetchone()
+    fresh = c.execute("SELECT * FROM users WHERE id=? AND username=? AND salt=? AND active=1", (user['id'], user['username'], user['salt'])).fetchone()
 if not fresh:
     logout()
 st.session_state.user = user = dict(fresh)
@@ -370,7 +395,7 @@ venue = st.session_state.chosen_venue
 pages = []
 if has('general_waste'): pages.append('General wastage')
 if has('line_clean'): pages.append('Line clean wastage')
-if has('history'): pages.extend(['Dashboard','History'])
+if has('history'): pages.extend(['Dashboard','Monthly analytics','History'])
 if has('stock'): pages.append('Stock settings')
 if is_admin: pages.append('Admin control')
 with st.sidebar:
@@ -543,6 +568,81 @@ elif page == "Dashboard":
     if not lines.empty or not general.empty:
         st.download_button("Download dashboard data (Excel)", excel_download({"Line clean": export_frame(lines), "General waste": export_frame(general)}), file_name=f"{venue}_dashboard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+elif page == "Monthly analytics":
+    st.subheader("Monthly wastage analytics")
+    st.caption("Calendar months in UK time; Friday–Thursday history is unchanged. General waste cost and line-clean pints are reported separately.")
+    scope = st.selectbox("Venue scope", [venue, "All authorised venues"] + [v for v in assigned if v != venue])
+    selected = assigned if scope == "All authorised venues" else [scope]
+    marks = ",".join("?" for _ in selected)
+    c = db()
+    try:
+        g = pd.read_sql_query(f"SELECT * FROM general_logs WHERE venue IN ({marks})", c, params=selected)
+        l = pd.read_sql_query(f"SELECT * FROM line_logs WHERE venue IN ({marks})", c, params=selected)
+    finally:
+        c.close()
+    for f in (g,l):
+        f["at"] = pd.to_datetime(f["at"], errors="coerce")
+        f.dropna(subset=["at"], inplace=True)
+    today = datetime.now(UK_TZ)
+    years = sorted({today.year} | set(g.at.dt.year) | set(l.at.dt.year), reverse=True)
+    year = st.selectbox("Year", years)
+    month = st.selectbox("Month", list(range(1,13)), index=today.month-1, format_func=lambda m: datetime(year,m,1).strftime("%B"))
+    gy = g[g.at.dt.year == year].copy()
+    ly = l[l.at.dt.year == year].copy()
+    annual = pd.DataFrame({"Month": [datetime(year,m,1).strftime("%B") for m in range(1,13)], "General waste (£)": gy.groupby(gy.at.dt.month).total_value.sum().reindex(range(1,13),fill_value=0).values, "Line-clean pints": ly.groupby(ly.at.dt.month).total_pints.sum().reindex(range(1,13),fill_value=0).values})
+    st.markdown("### Month-by-month totals")
+    st.dataframe(annual, hide_index=True, use_container_width=True)
+    st.bar_chart(annual, x="Month", y="General waste (£)")
+    st.bar_chart(annual, x="Month", y="Line-clean pints")
+    st.caption(f"Annual total: {money(gy.total_value.sum())} general waste; {ly.total_pints.sum():g} line-clean pints")
+    gm = gy[gy.at.dt.month == month].copy()
+    lm = ly[ly.at.dt.month == month].copy()
+    previous = pd.Timestamp(year=year,month=month,day=1)-pd.Timedelta(days=1)
+    gp = g[(g.at.dt.year==previous.year)&(g.at.dt.month==previous.month)]
+    lp = l[(l.at.dt.year==previous.year)&(l.at.dt.month==previous.month)]
+    a,b = st.columns(2)
+    a.metric("Monthly general waste", money(gm.total_value.sum()), delta=money(gm.total_value.sum()-gp.total_value.sum()), delta_color="inverse")
+    b.metric("Monthly line-clean pints", f"{lm.total_pints.sum():g}", delta=f"{lm.total_pints.sum()-lp.total_pints.sum():g} pints", delta_color="inverse")
+    comparison = pd.DataFrame({"Venue":selected,"General waste (£)":[gm.loc[gm.venue==v,"total_value"].sum() for v in selected],"Line-clean pints":[lm.loc[lm.venue==v,"total_pints"].sum() for v in selected]})
+    st.markdown("### Venue comparison")
+    st.dataframe(comparison, hide_index=True)
+    cat = gm.groupby("category",as_index=False).total_value.sum().rename(columns={"category":"Category","total_value":"General waste (£)"})
+    st.markdown("### Monthly categories")
+    st.dataframe(cat,hide_index=True)
+    st.markdown("### Most wasted products")
+    window = st.radio("Product tracking period", ["Selected month","Selected year","All time"], horizontal=True)
+    pg,pl = (gm,lm) if window=="Selected month" else (gy,ly) if window=="Selected year" else (g,l)
+    cats = sorted(pg.category.unique())
+    chosen = st.multiselect("General waste categories",cats,default=cats)
+    pg = pg[pg.category.isin(chosen)]
+    ranks = pg.groupby(["item","unit"],as_index=False).agg(Quantity=("qty","sum"),Cost=("total_value","sum"),Incidents=("id","count")).rename(columns={"item":"Product","unit":"Unit","Cost":"Cost (£)"})
+    metric = st.selectbox("Rank general waste by",["Cost (£)","Quantity","Incidents"])
+    if metric=="Quantity" and not ranks.empty:
+        unit = st.selectbox("Compare quantities in",sorted(ranks.Unit.unique()))
+        ranks = ranks[ranks.Unit==unit]
+    ranks = ranks.sort_values(metric,ascending=False)
+    st.dataframe(ranks,hide_index=True,use_container_width=True)
+    if not ranks.empty:
+        plot = ranks.assign(Label=ranks.Product+" ("+ranks.Unit+")").head(15)
+        st.bar_chart(plot,x="Label",y=metric,horizontal=True)
+    detail_rows=[]
+    for raw in pl.detail:
+        try:
+            for item in json.loads(raw):
+                amount=float(item["Total wasted (pints)"])
+                if amount>0: detail_rows.append({"Product":item["Product"],"Pints":amount,"Incidents":1})
+        except (ValueError,TypeError,KeyError):
+            continue
+    line_rank=pd.DataFrame(detail_rows,columns=["Product","Pints","Incidents"]).groupby("Product",as_index=False).sum().sort_values("Pints",ascending=False)
+    st.markdown("### Most wasted line-clean products")
+    st.dataframe(line_rank,hide_index=True)
+    if not line_rank.empty: st.bar_chart(line_rank,x="Product",y="Pints",horizontal=True)
+    if not pg.empty:
+        product=st.selectbox("Individual product history",sorted(pg.item.unique()))
+        hist=pg[pg.item==product].assign(Month=pg.at.dt.strftime("%Y-%m")).groupby(["Month","unit"],as_index=False).agg(Quantity=("qty","sum"),Cost=("total_value","sum"))
+        st.dataframe(hist,hide_index=True)
+    st.download_button("Download monthly and annual analytics (Excel)",excel_download({"Annual totals":annual,"Selected month venues":comparison,"Monthly categories":cat,"General product ranking":ranks,"Line clean ranking":line_rank,"Monthly general records":export_frame(gm),"Monthly line records":export_frame(lm)}),file_name=f"wastage_analytics_{year}_{month:02d}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 elif page == "History":
     st.subheader(f"{venue} — Weekly wastage history")
     st.caption("Working weeks run Friday 00:00 through Thursday 23:59:59, UK time. Older records are retained.")
@@ -678,6 +778,8 @@ elif page == "Stock settings":
 
 elif page == "Admin control" and is_admin:
     st.subheader("Admin control")
+    if st.session_state.get("deleted_user_notice"):
+        st.success(st.session_state.pop("deleted_user_notice"))
     tabs = st.tabs(["Venues", "Users & permissions"])
     with tabs[0]:
         st.markdown("#### Add a venue")
@@ -806,5 +908,19 @@ elif page == "Admin control" and is_admin:
                         c.close()
                         st.success("Account updated.")
                         st.rerun()
+
+
+                if person['id'] != user['id']:
+                    st.markdown("**Delete account**")
+                    st.caption("Permanently removes login and permissions. Existing wastage records are retained under the original username.")
+                    confirmed = st.checkbox(f"Confirm deletion of {person['username']}", key=f"confirm_delete_{person['id']}_{person['salt']}")
+                    if st.button("Delete user", key=f"delete_user_{person['id']}", disabled=not confirmed):
+                        try:
+                            delete_user(user, person['id'], person['username'], person['salt'])
+                        except (ValueError, sqlite3.Error) as exc:
+                            st.error(str(exc))
+                        else:
+                            st.session_state['deleted_user_notice'] = f"Account {person['username']} deleted. Historical records retained."
+                            st.rerun()
 
 st.caption("Admin controls venue creation and account permissions. Managers can manage stock for assigned venues. Team / Till users receive only the permissions enabled by Admin.")

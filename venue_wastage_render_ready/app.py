@@ -108,6 +108,8 @@ def db():
       unit_value REAL NOT NULL, total_value REAL NOT NULL, notes TEXT
     );
     """)
+    c.execute("CREATE TABLE IF NOT EXISTS line_presets(venue TEXT PRIMARY KEY, first_pints REAL NOT NULL, second_pints REAL NOT NULL)")
+    c.execute("CREATE TABLE IF NOT EXISTS line_overrides(stock_id INTEGER PRIMARY KEY, first_pints REAL NOT NULL, second_pints REAL NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS categories(venue TEXT, name TEXT, active INTEGER DEFAULT 1, PRIMARY KEY(venue,name))")
     # Upgrade older versions of the app in place.
     existing = {r["name"] for r in c.execute("SELECT name FROM venues").fetchall()}
@@ -283,20 +285,34 @@ def logout():
     st.rerun()
 
 
-def save_line_clean(venue, username, first, second, notes):
+def line_settings(venue):
+    c = db()
+    try:
+        row = c.execute("SELECT first_pints,second_pints FROM line_presets WHERE venue=?", (venue,)).fetchone()
+        defaults = tuple(row) if row else (5.0, 5.0)
+        overrides = {r[0]: (r[1],r[2]) for r in c.execute("SELECT s.name,o.first_pints,o.second_pints FROM line_overrides o JOIN stock s ON s.id=o.stock_id WHERE s.venue=? AND s.section='Line clean' AND s.active=1", (venue,))}
+        return defaults, overrides
+    finally:
+        c.close()
+
+
+def line_breakdown(first, second, defaults, overrides):
     detail = []
     for product in first:
-        f, s = int(first[product]) * 5, int(second.get(product, 0)) * 5
-        detail.append({
-            "Product": product, "First pull (pints)": f,
-            "Second pull (pints)": s, "Total wasted (pints)": f+s
-        })
+        rates = overrides.get(product, defaults)
+        f = round(int(first[product])*rates[0], 8)
+        s = round(int(second.get(product,0))*rates[1], 8)
+        detail.append({"Product":product,"First pull (pints)":f,"Second pull (pints)":s,"Total wasted (pints)":round(f+s,8)})
+    return detail
+
+
+def save_line_clean(venue, username, first, second, notes, detail):
     ft, staps = sum(first.values()), sum(second.values())
     c = db()
     c.execute("""INSERT INTO line_logs(venue,at,username,notes,first_taps,second_taps,total_pints,detail)
                  VALUES(?,?,?,?,?,?,?,?)""",
               (venue, datetime.now(UK_TZ).replace(tzinfo=None).isoformat(timespec="seconds"), username, notes,
-               ft, staps, (ft+staps)*5, json.dumps(detail)))
+               ft, staps, round(sum(r["Total wasted (pints)"] for r in detail),8), json.dumps(detail)))
     c.commit()
     c.close()
 
@@ -422,7 +438,8 @@ st.title(f"{venue} — Venue Wastage")
 
 if page == "Line clean wastage":
     st.subheader("Line clean wastage")
-    st.caption("Each tap counts as 5 pints.")
+    defaults, overrides = line_settings(venue)
+    st.caption(f"Default per tap: first {defaults[0]:g} pints, second {defaults[1]:g} pints. Product overrides apply automatically.")
     products = get_stock(venue, "Line clean")
     if not products:
         st.info("No active line-clean products. A manager or admin can add them in Stock settings.")
@@ -436,27 +453,24 @@ if page == "Line clean wastage":
         with left:
             st.markdown("#### First pull-through")
             for item in products:
-                first[item["name"]] = st.number_input(f"{item['name']} taps", 0, 100, 0, key=f"f_{venue}_{item['id']}")
+                first[item["name"]] = st.number_input(f"{item['name']} taps ({overrides.get(item['name'], defaults)[0]:g} pints each)", 0, 100, 0, key=f"f_{venue}_{item['id']}")
         with right:
             st.markdown("#### Second pull-through")
             for item in products:
-                second[item["name"]] = st.number_input(f"{item['name']} taps", 0, 100, 0, key=f"s_{venue}_{item['id']}")
+                second[item["name"]] = st.number_input(f"{item['name']} taps ({overrides.get(item['name'], defaults)[1]:g} pints each)", 0, 100, 0, key=f"s_{venue}_{item['id']}")
         ft, staps = sum(first.values()), sum(second.values())
         a, b, c = st.columns(3)
-        a.metric("First pull-through", f"{ft*5} pints", f"{ft} taps")
-        b.metric("Second pull-through", f"{staps*5} pints", f"{staps} taps")
-        c.metric("Total line-clean waste", f"{(ft+staps)*5} pints")
-        breakdown = []
-        for item in products:
-            p = item["name"]
-            f, s = first[p]*5, second[p]*5
-            breakdown.append({"Product": p, "First pull (pints)": f,
-                              "Second pull (pints)": s, "Total wasted (pints)": f+s})
+        breakdown = line_breakdown(first, second, defaults, overrides)
+        fp = sum(r["First pull (pints)"] for r in breakdown)
+        sp = sum(r["Second pull (pints)"] for r in breakdown)
+        a.metric("First pull-through", f"{fp:g} pints", f"{ft} taps")
+        b.metric("Second pull-through", f"{sp:g} pints", f"{staps} taps")
+        c.metric("Total line-clean waste", f"{fp+sp:g} pints")
         st.markdown("#### Pints wasted by product")
         st.dataframe(pd.DataFrame(breakdown), hide_index=True, use_container_width=True)
         notes = st.text_input("Notes (optional)", key="line_notes")
         if st.button("Save line clean", type="primary", disabled=(ft+staps == 0)):
-            save_line_clean(venue, user["username"], first, second, notes)
+            save_line_clean(venue, user["username"], first, second, notes, breakdown)
             st.session_state.reset_line = True
             st.success("Line clean saved.")
             st.rerun()
@@ -511,7 +525,7 @@ elif page == "Dashboard":
             if since is not None:
                 frame.drop(frame.index[frame["at"] < since], inplace=True)
     a,b,c,d = st.columns(4)
-    a.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.0f} pints")
+    a.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.2f} pints")
     b.metric("General waste value", money(general['total_value'].sum() if not general.empty else 0))
     c.metric("Line-clean entries", len(lines))
     d.metric("General waste entries", len(general))
@@ -656,7 +670,7 @@ elif page == "History":
     general = filter_work_week(all_general, selected_week)
     st.caption(f"Selected: {week_label(selected_week)}")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.0f} pints")
+    col1.metric("Line-clean waste", f"{lines['total_pints'].sum() if not lines.empty else 0:,.2f} pints")
     col2.metric("General wastage value", money(general['total_value'].sum() if not general.empty else 0))
     col3.metric("Records", len(lines) + len(general))
     t1, t2 = st.tabs(["Line cleans", "General wastage"])
@@ -698,7 +712,48 @@ elif page == "History":
 elif page == "Stock settings":
     st.subheader("Stock settings")
     st.caption("These changes apply only to the currently selected venue.")
-    kind = st.radio("Stock list", ["Line-clean products", "General wastage products"], horizontal=True)
+    options = ["Line-clean products", "General wastage products"]
+    if is_admin or is_manager: options.append("Line clean settings")
+    kind = st.radio("Stock list", options, horizontal=True)
+    if kind == "Line clean settings":
+        defaults, overrides = line_settings(venue)
+        st.caption("Pints per tap, per pull-through. Changes affect future entries only.")
+        with st.form(f"line_defaults_{venue}"):
+            f = st.number_input("Default first pull-through", min_value=0.0, value=defaults[0], step=0.5, format="%.3f")
+            g = st.number_input("Default second pull-through", min_value=0.0, value=defaults[1], step=0.5, format="%.3f")
+            if st.form_submit_button("Save venue defaults"):
+                with db() as c:
+                    c.execute("INSERT OR REPLACE INTO line_presets VALUES(?,?,?)", (venue,f,g))
+                st.rerun()
+        st.markdown("### Product overrides")
+        for item in get_stock(venue, "Line clean"):
+            name = item["name"]
+            rates = overrides.get(name, defaults)
+            with st.expander(f"{name}: {rates[0]:g} / {rates[1]:g} pints"):
+                with st.form(f"line_override_{item['id']}"):
+                    custom = st.checkbox("Use custom values", value=name in overrides)
+                    f = st.number_input("First pull-through", min_value=0.0, value=rates[0], step=0.5, format="%.3f")
+                    g = st.number_input("Second pull-through", min_value=0.0, value=rates[1], step=0.5, format="%.3f")
+                    if st.form_submit_button("Save product preset"):
+                        with db() as c:
+                            if custom: c.execute("INSERT OR REPLACE INTO line_overrides VALUES(?,?,?)", (item['id'],f,g))
+                            else: c.execute("DELETE FROM line_overrides WHERE stock_id=?", (item['id'],))
+                        st.rerun()
+        st.markdown("### Sync line clean settings")
+        targets = st.multiselect("Destination venues", [v for v in assigned if v != venue], key=f"line_targets_{venue}")
+        st.caption("Copies venue defaults and matching active product presets, including resetting matching products to defaults where appropriate. Unmatched product overrides are retained. No stock is copied.")
+        if st.checkbox("Confirm preset sync", key=f"line_confirm_{venue}") and st.button("Sync line clean settings", disabled=not targets):
+            source_names = {i['name'] for i in get_stock(venue,"Line clean")}
+            with db() as c:
+                for target in targets:
+                    c.execute("INSERT OR REPLACE INTO line_presets VALUES(?,?,?)", (target,*defaults))
+                    for item in c.execute("SELECT id,name FROM stock WHERE venue=? AND section='Line clean' AND active=1", (target,)).fetchall():
+                        if item['name'] in overrides:
+                            c.execute("INSERT OR REPLACE INTO line_overrides VALUES(?,?,?)", (item['id'],*overrides[item['name']]))
+                        elif item['name'] in source_names:
+                            c.execute("DELETE FROM line_overrides WHERE stock_id=?", (item['id'],))
+            st.success("Line clean settings synced.")
+        st.stop()
     if kind == "General wastage products":
         with st.form('category_add'):
             new_cat = st.text_input('New category')
@@ -822,6 +877,7 @@ elif page == "Admin control" and is_admin:
                             if venue_name.strip() != vr["name"]:
                                 c.execute("UPDATE access SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE categories SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
+                                c.execute("UPDATE line_presets SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE stock SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE line_logs SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
                                 c.execute("UPDATE general_logs SET venue=? WHERE venue=?", (venue_name.strip(), vr["name"]))
